@@ -1,7 +1,7 @@
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Briefcase, Clock, CheckCircle, Wrench } from "lucide-react";
+import { Briefcase, Clock, CheckCircle, Wrench, MapPin } from "lucide-react";
 import { Link } from "wouter";
 import type { ServiceRequest } from "@shared/schema";
 import { Badge } from "@/components/ui/badge";
@@ -22,8 +22,47 @@ import { zodResolver } from "@hookform/resolvers/zod";
 export default function TechnicianDashboard() {
   const { user } = useAuth();
   const { toast } = useToast();
+  const [coords, setCoords] = useState<{ lat: number; lon: number } | null>(null);
+  const [sortMode, setSortMode] = useState<'newest' | 'nearest'>('newest');
   const { data: myJobs = [], isLoading } = useQuery<ServiceRequest[]>({
     queryKey: ['/api/service-requests'],
+  });
+
+  // Start job
+  const startJobMutation = useMutation({
+    mutationFn: async (id: string) => await apiRequest('POST', `/api/service-requests/${id}/start`),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['/api/service-requests'] });
+      queryClient.invalidateQueries({ queryKey: ['/api/my/jobs'] });
+      toast({ title: 'Job started', description: 'This job is now in progress.' });
+    },
+    onError: (err: any) => toast({ title: 'Failed to start job', description: err?.message || 'Please try again', variant: 'destructive' })
+  });
+
+  // Complete job dialog state and mutation
+  const [completeOpen, setCompleteOpen] = useState(false);
+  const [completeJobId, setCompleteJobId] = useState<string | null>(null);
+  const completeSchema = z.object({
+    totalPrice: z.coerce.number().positive('Total price must be greater than 0'),
+    summary: z.string().min(5, 'Please provide a short summary'),
+  });
+  const completeForm = useForm<z.infer<typeof completeSchema>>({
+    resolver: zodResolver(completeSchema),
+    defaultValues: { totalPrice: undefined as unknown as number, summary: '' },
+  });
+
+  const completeJobMutation = useMutation({
+    mutationFn: async (vars: { id: string; totalPrice: number; summary: string }) =>
+      await apiRequest('POST', `/api/service-requests/${vars.id}/complete`, { totalPrice: vars.totalPrice, summary: vars.summary }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['/api/service-requests'] });
+      queryClient.invalidateQueries({ queryKey: ['/api/my/jobs'] });
+      toast({ title: 'Job completed', description: 'The job was marked as completed.' });
+      setCompleteOpen(false);
+      setCompleteJobId(null);
+      completeForm.reset();
+    },
+    onError: (err: any) => toast({ title: 'Failed to complete job', description: err?.message || 'Please try again', variant: 'destructive' })
   });
 
   const { data: availableJobs = [] } = useQuery<ServiceRequest[]>({
@@ -43,29 +82,20 @@ export default function TechnicianDashboard() {
     },
   });
 
-  // Create Job popup form
-  const [openCreate, setOpenCreate] = useState(false);
-  const createJobSchema = z.object({
-    serviceType: z.string().min(1, 'Service type is required'),
-    description: z.string().min(10, 'Description must be at least 10 characters'),
-    location: z.string().min(3, 'Location is required'),
-  });
-  const form = useForm<z.infer<typeof createJobSchema>>({
-    resolver: zodResolver(createJobSchema),
-    defaultValues: { serviceType: '', description: '', location: '' },
-  });
-
-  const createJobMutation = useMutation({
-    mutationFn: async (data: z.infer<typeof createJobSchema>) => {
-      return await apiRequest('POST', '/api/technician/jobs', data);
+  // Accept job mutation
+  const acceptJobMutation = useMutation({
+    mutationFn: async (id: string) => {
+      return await apiRequest('POST', `/api/service-requests/${id}/accept`);
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['/api/my/jobs'] });
       queryClient.invalidateQueries({ queryKey: ['/api/service-requests'] });
-      toast({ title: 'Job created', description: 'Your job has been posted successfully' });
-      setOpenCreate(false);
-      form.reset();
+      queryClient.invalidateQueries({ queryKey: ['/api/service-requests/available'] });
+      queryClient.invalidateQueries({ queryKey: ['/api/my/jobs'] });
+      toast({ title: 'Job accepted', description: 'The job has been assigned to you.' });
     },
+    onError: (err: any) => {
+      toast({ title: 'Failed to accept job', description: err?.message || 'Please try again', variant: 'destructive' });
+    }
   });
 
   const stats = {
@@ -73,6 +103,48 @@ export default function TechnicianDashboard() {
     active: myJobs.filter(r => r.status === 'accepted' || r.status === 'in_progress').length,
     completed: myJobs.filter(r => r.status === 'completed').length,
   };
+
+  const skillFiltered = (availableJobs || []).filter((job) => {
+    const skills = user?.skills || [];
+    if (!skills.length) return true;
+    return skills.includes(job.serviceType);
+  });
+
+  // Try parse "lat, lon" from location string
+  const parseLatLon = (loc?: string) => {
+    if (!loc) return null;
+    const m = loc.match(/\s*(-?\d+\.?\d*)\s*,\s*(-?\d+\.?\d*)\s*/);
+    if (!m) return null;
+    const lat = parseFloat(m[1]);
+    const lon = parseFloat(m[2]);
+    if (Number.isNaN(lat) || Number.isNaN(lon)) return null;
+    return { lat, lon };
+  };
+
+  const haversine = (a: {lat:number;lon:number}, b: {lat:number;lon:number}) => {
+    const R = 6371; // km
+    const dLat = (b.lat - a.lat) * Math.PI/180;
+    const dLon = (b.lon - a.lon) * Math.PI/180;
+    const la1 = a.lat * Math.PI/180;
+    const la2 = b.lat * Math.PI/180;
+    const x = Math.sin(dLat/2)**2 + Math.sin(dLon/2)**2 * Math.cos(la1) * Math.cos(la2);
+    const d = 2 * Math.asin(Math.sqrt(x));
+    return R * d;
+  };
+
+  const sortedAvailable = [...skillFiltered].sort((j1, j2) => {
+    if (sortMode === 'nearest' && coords) {
+      const p1 = parseLatLon(j1.location);
+      const p2 = parseLatLon(j2.location);
+      const d1 = p1 ? haversine(coords, p1) : Number.POSITIVE_INFINITY;
+      const d2 = p2 ? haversine(coords, p2) : Number.POSITIVE_INFINITY;
+      return d1 - d2;
+    }
+    // default: newest first by createdAt
+    const t1 = (j1 as any).createdAt ? new Date(j1.createdAt as any).getTime() : 0;
+    const t2 = (j2 as any).createdAt ? new Date(j2.createdAt as any).getTime() : 0;
+    return t2 - t1;
+  });
 
   const getStatusBadge = (status: string) => {
     const variants: Record<string, { variant: any; label: string }> = {
@@ -110,84 +182,7 @@ export default function TechnicianDashboard() {
         </div>
       </div>
 
-      <div className="flex items-center justify-end">
-        <Button onClick={() => setOpenCreate(true)} data-testid="button-open-create-job">
-          Create Job
-        </Button>
-      </div>
-
-      <Dialog open={openCreate} onOpenChange={setOpenCreate}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Create Job</DialogTitle>
-          </DialogHeader>
-          <Form {...form}>
-            <form onSubmit={form.handleSubmit((data) => createJobMutation.mutate(data))} className="space-y-4">
-              <FormField
-                control={form.control}
-                name="serviceType"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>Service Type</FormLabel>
-                    <FormControl>
-                      <Input placeholder="e.g. Plumber" {...field} />
-                    </FormControl>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-              <FormField
-                control={form.control}
-                name="location"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>Location</FormLabel>
-                    <div className="flex gap-2">
-                      <FormControl>
-                        <Input placeholder="Enter area or use current location" {...field} />
-                      </FormControl>
-                      <Button
-                        type="button"
-                        variant="outline"
-                        onClick={() => {
-                          if (navigator.geolocation) {
-                            navigator.geolocation.getCurrentPosition((pos) => {
-                              const { latitude, longitude } = pos.coords;
-                              form.setValue('location', `${latitude.toFixed(6)}, ${longitude.toFixed(6)}`);
-                            });
-                          }
-                        }}
-                      >
-                        Use current
-                      </Button>
-                    </div>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-              <FormField
-                control={form.control}
-                name="description"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>Description</FormLabel>
-                    <FormControl>
-                      <Textarea className="min-h-32" placeholder="Describe the job" {...field} />
-                    </FormControl>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-              <div className="flex gap-2">
-                <Button type="button" variant="outline" onClick={() => setOpenCreate(false)}>Cancel</Button>
-                <Button type="submit" disabled={createJobMutation.isPending}>
-                  {createJobMutation.isPending ? 'Creating...' : 'Create Job'}
-                </Button>
-              </div>
-            </form>
-          </Form>
-        </DialogContent>
-      </Dialog>
+      {/* Removed job creation UI; technicians accept client requests instead */}
 
       <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
         <Card data-testid="card-stat-total">
@@ -222,8 +217,27 @@ export default function TechnicianDashboard() {
       </div>
 
       <div>
-        <h2 className="text-2xl font-bold mb-4" data-testid="heading-available-jobs">Available Jobs ({availableJobs.length})</h2>
-        {availableJobs.length === 0 ? (
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-2xl font-bold" data-testid="heading-available-jobs">Available Jobs ({sortedAvailable.length})</h2>
+          <div className="flex items-center gap-2">
+            <Button variant="outline" size="sm" onClick={() => {
+              if (navigator.geolocation) {
+                navigator.geolocation.getCurrentPosition((pos) => {
+                  setCoords({ lat: pos.coords.latitude, lon: pos.coords.longitude });
+                  setSortMode('nearest');
+                });
+              } else {
+                toast({ title: 'Geolocation not available', variant: 'destructive' });
+              }
+            }} data-testid="button-use-current-location-tech">
+              Use my location
+            </Button>
+            <Button variant={sortMode==='nearest' ? 'default':'outline'} size="sm" onClick={() => setSortMode(sortMode==='nearest'?'newest':'nearest')} data-testid="button-toggle-sort">
+              {sortMode === 'nearest' ? 'Nearest' : 'Newest'}
+            </Button>
+          </div>
+        </div>
+        {sortedAvailable.length === 0 ? (
           <Card data-testid="card-empty-available">
             <CardContent className="p-12 text-center">
               <Wrench className="w-12 h-12 mx-auto mb-4 text-muted-foreground" />
@@ -235,7 +249,7 @@ export default function TechnicianDashboard() {
           </Card>
         ) : (
           <div className="space-y-4">
-            {availableJobs.slice(0, 3).map((job) => (
+            {sortedAvailable.slice(0, 3).map((job) => (
               <Card key={job.id} className="hover-elevate" data-testid={`card-job-${job.id}`}>
                 <CardContent className="p-6">
                   <div className="flex items-start justify-between mb-4">
@@ -243,8 +257,8 @@ export default function TechnicianDashboard() {
                       <h3 className="text-lg font-semibold mb-1" data-testid={`text-job-title-${job.id}`}>
                         {job.serviceType}
                       </h3>
-                      <p className="text-sm text-muted-foreground" data-testid={`text-job-location-${job.id}`}>
-                        {job.location}
+                      <p className="text-sm text-muted-foreground flex items-center gap-1" data-testid={`text-job-location-${job.id}`}>
+                        <MapPin className="w-4 h-4" /> {job.location}
                       </p>
                     </div>
                     {getStatusBadge(job.status)}
@@ -252,15 +266,22 @@ export default function TechnicianDashboard() {
                   <p className="text-sm mb-4 line-clamp-2" data-testid={`text-job-description-${job.id}`}>
                     {job.description}
                   </p>
-                  <Link href={`/jobs/${job.id}`}>
-                    <Button variant="outline" size="sm" data-testid={`button-view-job-${job.id}`}>
-                      View Details
-                    </Button>
-                  </Link>
+                  <div className="flex gap-2">
+                    <Link href={`/jobs/${job.id}`}>
+                      <Button variant="outline" size="sm" data-testid={`button-view-job-${job.id}`}>
+                        View Details
+                      </Button>
+                    </Link>
+                    {job.status === 'pending' && (
+                      <Button size="sm" className="bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700" onClick={() => acceptJobMutation.mutate(job.id)} data-testid={`button-accept-job-${job.id}`}>
+                        Accept Job
+                      </Button>
+                    )}
+                  </div>
                 </CardContent>
               </Card>
             ))}
-            {availableJobs.length > 3 && (
+            {sortedAvailable.length > 3 && (
               <Link href="/jobs">
                 <Button variant="outline" className="w-full" data-testid="button-view-all-jobs">
                   View All Available Jobs
@@ -293,8 +314,8 @@ export default function TechnicianDashboard() {
                       <h3 className="text-lg font-semibold mb-1" data-testid={`text-my-job-title-${job.id}`}>
                         {job.serviceType}
                       </h3>
-                      <p className="text-sm text-muted-foreground" data-testid={`text-my-job-location-${job.id}`}>
-                        {job.location}
+                      <p className="text-sm text-muted-foreground flex items-center gap-1" data-testid={`text-my-job-location-${job.id}`}>
+                        <MapPin className="w-4 h-4" /> {job.location}
                       </p>
                     </div>
                     {getStatusBadge(job.status)}
@@ -302,17 +323,77 @@ export default function TechnicianDashboard() {
                   <p className="text-sm mb-4 line-clamp-2" data-testid={`text-my-job-description-${job.id}`}>
                     {job.description}
                   </p>
-                  <Link href={`/my-jobs/${job.id}`}>
-                    <Button variant="outline" size="sm" data-testid={`button-view-my-job-${job.id}`}>
-                      View Details
-                    </Button>
-                  </Link>
+                  <div className="flex flex-wrap gap-2">
+                    <Link href={`/my-jobs/${job.id}`}>
+                      <Button variant="outline" size="sm" data-testid={`button-view-my-job-${job.id}`}>
+                        View Details
+                      </Button>
+                    </Link>
+                    {job.status === 'accepted' && (
+                      <Button size="sm" onClick={() => startJobMutation.mutate(job.id)} data-testid={`button-start-job-${job.id}`}>
+                        Start Job
+                      </Button>
+                    )}
+                    {job.status === 'in_progress' && (
+                      <Button size="sm" className="bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700" onClick={() => { setCompleteJobId(job.id); setCompleteOpen(true); }} data-testid={`button-complete-job-${job.id}`}>
+                        Complete Job
+                      </Button>
+                    )}
+                  </div>
                 </CardContent>
               </Card>
             ))}
           </div>
         )}
       </div>
+
+      <Dialog open={completeOpen} onOpenChange={(o) => { setCompleteOpen(o); if (!o) completeForm.reset(); }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Complete Job</DialogTitle>
+          </DialogHeader>
+          <Form {...completeForm}>
+            <form
+              onSubmit={completeForm.handleSubmit(({ totalPrice, summary }) => {
+                if (!completeJobId) return;
+                completeJobMutation.mutate({ id: completeJobId, totalPrice, summary });
+              })}
+              className="space-y-4"
+            >
+              <FormField
+                control={completeForm.control}
+                name="totalPrice"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Total Price ($)</FormLabel>
+                    <FormControl>
+                      <Input type="number" step="1" min="1" placeholder="e.g. 120" {...field} />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={completeForm.control}
+                name="summary"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Work Summary</FormLabel>
+                    <FormControl>
+                      <Textarea placeholder="Describe what was done" className="min-h-24" {...field} />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <div className="flex gap-2 justify-end">
+                <Button type="button" variant="outline" onClick={() => { setCompleteOpen(false); completeForm.reset(); }}>Cancel</Button>
+                <Button type="submit" disabled={completeJobMutation.isPending}>{completeJobMutation.isPending ? 'Submitting...' : 'Complete Job'}</Button>
+              </div>
+            </form>
+          </Form>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

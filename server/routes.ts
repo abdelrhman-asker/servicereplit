@@ -27,6 +27,54 @@ export async function registerRoutes(app: Express): Promise<Server> {
         firstName: z.string().optional(),
         lastName: z.string().optional(),
       });
+
+  // Technician starts an accepted job (accepted -> in_progress)
+  app.post('/api/service-requests/:id/start', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user?.claims?.sub || req.user?.id;
+      const user = await storage.getUser(userId);
+      if (!user || user.userType !== 'technician') {
+        return res.status(403).json({ message: 'Access denied. Technician role required.' });
+      }
+      const { id } = req.params;
+      const request = await storage.getServiceRequest(id);
+      if (!request) return res.status(404).json({ message: 'Service request not found' });
+      if (request.technicianId !== userId) return res.status(403).json({ message: 'Not your job' });
+      if (request.status !== 'accepted') return res.status(400).json({ message: 'Only accepted jobs can be started' });
+      const updated = await storage.updateServiceRequest(id, { status: 'in_progress' } as any);
+      return res.json(updated);
+    } catch (error) {
+      console.error('Error starting job:', error);
+      return res.status(500).json({ message: 'Failed to start job' });
+    }
+  });
+
+  // Technician completes an in-progress job (in_progress -> completed) and records price & summary
+  app.post('/api/service-requests/:id/complete', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user?.claims?.sub || req.user?.id;
+      const user = await storage.getUser(userId);
+      if (!user || user.userType !== 'technician') {
+        return res.status(403).json({ message: 'Access denied. Technician role required.' });
+      }
+      const { id } = req.params;
+      const { totalPrice, summary } = req.body || {};
+      const request = await storage.getServiceRequest(id);
+      if (!request) return res.status(404).json({ message: 'Service request not found' });
+      if (request.technicianId !== userId) return res.status(403).json({ message: 'Not your job' });
+      if (request.status !== 'in_progress') return res.status(400).json({ message: 'Only in-progress jobs can be completed' });
+      if (typeof totalPrice !== 'number' || totalPrice <= 0) return res.status(400).json({ message: 'Invalid total price' });
+      const updated = await storage.updateServiceRequest(id, {
+        status: 'completed',
+        quotedPrice: Math.round(totalPrice),
+        technicianNotes: summary || null,
+      } as any);
+      return res.json(updated);
+    } catch (error) {
+      console.error('Error completing job:', error);
+      return res.status(500).json({ message: 'Failed to complete job' });
+    }
+  });
       const { email, password, firstName, lastName } = schema.parse(req.body);
 
       const existing = await storage.getUserByEmail(email);
@@ -48,6 +96,31 @@ export async function registerRoutes(app: Express): Promise<Server> {
       return res.json(user);
     } catch (error: any) {
       return res.status(400).json({ message: 'Invalid signup data', error: error?.message });
+    }
+  });
+
+  // Technician accepts a pending job
+  app.post('/api/service-requests/:id/accept', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user?.claims?.sub || req.user?.id;
+      const user = await storage.getUser(userId);
+      if (!user || user.userType !== 'technician') {
+        return res.status(403).json({ message: 'Access denied. Technician role required.' });
+      }
+      const { id } = req.params;
+      const request = await storage.getServiceRequest(id);
+      if (!request) return res.status(404).json({ message: 'Service request not found' });
+      if (request.status !== 'pending') return res.status(400).json({ message: 'Only pending requests can be accepted' });
+      if (request.technicianId) return res.status(400).json({ message: 'Request already assigned' });
+
+      const updated = await storage.updateServiceRequest(id, {
+        technicianId: userId,
+        status: 'accepted',
+      } as any);
+      return res.json(updated);
+    } catch (error) {
+      console.error('Error accepting job:', error);
+      return res.status(500).json({ message: 'Failed to accept job' });
     }
   });
 
